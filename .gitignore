@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# USB capture / research artifacts
+*.pcapng
+mouse_packets.txt
+Attack-Shark-K86/
+epomaker-controller/
+
+# IDE
+.idea/
