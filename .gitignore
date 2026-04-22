@@ -1,5 +1,9 @@
 # Runtime
 tray_app.pid
+BatteryMonitor.pid
+
+# Build artifacts
+icon.ico
 
 # Python
 __pycache__/
@@ -9,7 +13,7 @@ __pycache__/
 # PyInstaller
 build/
 dist/
-*.spec
+mouse-battery.spec
 
 # USB capture / research artifacts
 *.pcapng

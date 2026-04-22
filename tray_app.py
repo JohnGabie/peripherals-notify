@@ -4,14 +4,16 @@ Battery Monitor — System Tray App
 Monitors Attack Shark X6 mouse, K86 keyboard, and Logitech G PRO X 2 headset.
 Notifies at 25%, 10%, 5%, 1% per device via native Windows toast notifications.
 
-Tray icon color:
-  green  > 25%
-  orange 10–25%
-  red    ≤ 10%
-  grey   all devices disconnected
+CLI flags (EXE or script):
+  --install     Copy to install dir, register startup task, launch
+  --uninstall   Remove startup task and stop running instance
+  (no flags)    Run the tray app
 """
 
+import ctypes
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -20,9 +22,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-# PID file sits next to this script so update.bat can find and kill us cleanly
-_PID_FILE = Path(__file__).parent / "tray_app.pid"
-
 import pystray
 from PIL import Image, ImageDraw
 
@@ -30,9 +29,27 @@ import mouse_battery
 import keyboard_battery
 import headset_battery
 
-log = logging.getLogger("tray")
+# ── Paths ─────────────────────────────────────────────────────────────────────
 
-THRESHOLDS   = [25, 10, 5, 1]   # alert at these % levels (per device)
+_FROZEN = getattr(sys, "frozen", False)
+
+# When frozen: executable is the .exe itself.
+# When running as script: use the script's directory.
+_THIS_EXE = Path(sys.executable) if _FROZEN else Path(sys.argv[0]).resolve()
+
+INSTALL_DIR  = Path(r"D:\Program Files (x86)\BatteryMonitor")
+INSTALL_EXE  = INSTALL_DIR / "BatteryMonitor.exe"
+_TASK_NAME   = "BatteryMonitor"
+
+# PID file lives next to the running EXE so --install can find and stop it
+_PID_FILE = (_THIS_EXE.parent / "BatteryMonitor.pid") if _FROZEN \
+            else (Path(__file__).parent / "tray_app.pid")
+
+log = logging.getLogger("battery_monitor")
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+THRESHOLDS   = [25, 10, 5, 1]
 POLL_SECONDS = 60
 
 
@@ -42,12 +59,8 @@ def _notify(title: str, message: str) -> None:
     log.info("NOTIFY  %s — %s", title, message)
     try:
         from winotify import Notification
-        Notification(
-            app_id="Battery Monitor",
-            title=title,
-            msg=message,
-            duration="short",
-        ).show()
+        Notification(app_id="Battery Monitor", title=title,
+                     msg=message, duration="short").show()
         return
     except Exception:
         pass
@@ -68,17 +81,16 @@ def _battery_color(pct: Optional[int]) -> tuple:
 
 
 def _make_icon(pct: Optional[int]) -> Image.Image:
-    """Draw a 64×64 RGBA battery icon filled to `pct`%."""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d   = ImageDraw.Draw(img)
     c   = _battery_color(pct)
 
-    d.rectangle([4, 16, 54, 52], outline=c, width=3)   # body outline
-    d.rectangle([54, 28, 60, 40], fill=c)               # positive nub
+    d.rectangle([4, 16, 54, 52], outline=c, width=3)
+    d.rectangle([54, 28, 60, 40], fill=c)
 
     if pct is not None and pct > 0:
         fill_w = max(1, int(46 * pct / 100))
-        d.rectangle([7, 19, 7 + fill_w, 49], fill=c)   # fill bar
+        d.rectangle([7, 19, 7 + fill_w, 49], fill=c)
 
     return img
 
@@ -113,10 +125,8 @@ def _refresh_tray() -> None:
     icon = _tray_icon
     if icon is None:
         return
-
     levels = [d.last_pct for d in DEVICES if d.last_pct is not None]
     lowest = min(levels) if levels else None
-
     icon.icon  = _make_icon(lowest)
     icon.title = _tooltip()
     icon.menu  = _build_menu()
@@ -145,15 +155,47 @@ def _build_menu() -> pystray.Menu:
 
 
 def _quit(icon: pystray.Icon, _item) -> None:
-    _pid_file_remove()
+    _pid_remove()
     icon.stop()
+
+
+# ── PID file ──────────────────────────────────────────────────────────────────
+
+def _pid_write() -> None:
+    try:
+        _PID_FILE.write_text(str(os.getpid()))
+    except Exception:
+        pass
+
+
+def _pid_remove() -> None:
+    try:
+        _PID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _pid_stop(pid_file: Path) -> None:
+    """Kill the process recorded in pid_file, then delete it."""
+    if not pid_file.exists():
+        return
+    try:
+        pid = int(pid_file.read_text().strip())
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                       capture_output=True)
+        time.sleep(1.5)
+    except Exception:
+        pass
+    try:
+        pid_file.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 # ── Monitor thread ────────────────────────────────────────────────────────────
 
 def _run_device(dev: _DevState, read_fn) -> None:
     thresholds = sorted(THRESHOLDS, reverse=True)
-
     while True:
         try:
             pct = read_fn()
@@ -171,7 +213,6 @@ def _run_device(dev: _DevState, read_fn) -> None:
             if pct != dev.last_pct:
                 log.info("%s: %d%%", dev.label, pct)
 
-            # Battery recovered — reset alerts that are now above current level
             if dev.last_pct is not None and pct > dev.last_pct:
                 dev.triggered = {t for t in dev.triggered if t >= pct}
 
@@ -192,21 +233,7 @@ def _run_device(dev: _DevState, read_fn) -> None:
         time.sleep(POLL_SECONDS)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-def _pid_file_write() -> None:
-    try:
-        _PID_FILE.write_text(str(os.getpid()))
-    except Exception:
-        pass
-
-
-def _pid_file_remove() -> None:
-    try:
-        _PID_FILE.unlink(missing_ok=True)
-    except Exception:
-        pass
-
+# ── Tray app entry point ──────────────────────────────────────────────────────
 
 def main() -> None:
     global _tray_icon
@@ -217,7 +244,7 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    _pid_file_write()
+    _pid_write()
 
     for dev, read_fn in zip(DEVICES, READERS):
         threading.Thread(
@@ -233,9 +260,109 @@ def main() -> None:
         title="Battery Monitor",
         menu=_build_menu(),
     )
-    log.info("Battery Monitor started — check the system tray.")
+    log.info("Battery Monitor started.")
     _tray_icon.run()
 
 
+# ── Install / Uninstall ───────────────────────────────────────────────────────
+
+def _is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _elevate_and_rerun() -> None:
+    """Re-launch the current process with admin privileges."""
+    args = " ".join(f'"{a}"' for a in sys.argv)
+    ctypes.windll.shell32.ShellExecuteW(
+        None, "runas", str(_THIS_EXE), args, None, 1
+    )
+    sys.exit(0)
+
+
+def _schtasks(*args: str) -> bool:
+    result = subprocess.run(["schtasks", *args], capture_output=True)
+    return result.returncode == 0
+
+
+def cmd_install() -> None:
+    """Copy this EXE to INSTALL_DIR, register startup task, and launch."""
+    if not _is_admin():
+        print("Requesting admin rights for install...")
+        _elevate_and_rerun()
+        return
+
+    installed_pid = INSTALL_DIR / "BatteryMonitor.pid"
+    if installed_pid.exists():
+        print("Stopping running instance...")
+        _pid_stop(installed_pid)
+
+    print(f"Creating directory: {INSTALL_DIR}")
+    INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(f"Copying: {_THIS_EXE}  →  {INSTALL_EXE}")
+    shutil.copy2(_THIS_EXE, INSTALL_EXE)
+
+    ok = _schtasks(
+        "/create",
+        "/tn",    _TASK_NAME,
+        "/sc",    "ONLOGON",
+        "/tr",    f'"{INSTALL_EXE}"',
+        "/delay", "0000:30",
+        "/f",
+    )
+    if ok:
+        print(f'Startup task "{_TASK_NAME}" registered.')
+    else:
+        print("WARNING: Failed to register startup task.")
+
+    print("Launching Battery Monitor...")
+    subprocess.Popen(
+        [str(INSTALL_EXE)],
+        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+        close_fds=True,
+    )
+    print("Done.")
+
+
+def cmd_uninstall() -> None:
+    """Remove startup task and stop the running instance."""
+    if not _is_admin():
+        print("Requesting admin rights for uninstall...")
+        _elevate_and_rerun()
+        return
+
+    print("Stopping running instance...")
+    _pid_stop(INSTALL_DIR / "BatteryMonitor.pid")
+
+    if _schtasks("/delete", "/tn", _TASK_NAME, "/f"):
+        print(f'Startup task "{_TASK_NAME}" removed.')
+    else:
+        print(f'Task "{_TASK_NAME}" not found (already removed?).')
+
+    print(f"Files kept at: {INSTALL_DIR}")
+    print("Delete the folder manually if you want a full cleanup.")
+
+
+# ── CLI entry ─────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Battery Monitor — Attack Shark X6 / K86, Logitech G PRO X 2"
+    )
+    parser.add_argument("--install",   action="store_true",
+                        help=f"Install to {INSTALL_DIR} and register startup task")
+    parser.add_argument("--uninstall", action="store_true",
+                        help="Remove startup task and stop running instance")
+    args = parser.parse_args()
+
+    if args.install:
+        cmd_install()
+    elif args.uninstall:
+        cmd_uninstall()
+    else:
+        main()
