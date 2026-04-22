@@ -11,11 +11,17 @@ Tray icon color:
   grey   all devices disconnected
 """
 
+import os
+import sys
 import threading
 import time
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
+
+# PID file sits next to this script so update.bat can find and kill us cleanly
+_PID_FILE = Path(__file__).parent / "tray_app.pid"
 
 import pystray
 from PIL import Image, ImageDraw
@@ -139,6 +145,7 @@ def _build_menu() -> pystray.Menu:
 
 
 def _quit(icon: pystray.Icon, _item) -> None:
+    _pid_file_remove()
     icon.stop()
 
 
@@ -187,6 +194,20 @@ def _run_device(dev: _DevState, read_fn) -> None:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _pid_file_write() -> None:
+    try:
+        _PID_FILE.write_text(str(os.getpid()))
+    except Exception:
+        pass
+
+
+def _pid_file_remove() -> None:
+    try:
+        _PID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def main() -> None:
     global _tray_icon
 
@@ -195,6 +216,8 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    _pid_file_write()
 
     for dev, read_fn in zip(DEVICES, READERS):
         threading.Thread(

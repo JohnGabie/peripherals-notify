@@ -1,3 +1,6 @@
+# Runtime
+tray_app.pid
+
 # Python
 __pycache__/
 *.pyc
