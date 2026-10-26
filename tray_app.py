@@ -97,23 +97,35 @@ def _make_icon(pct: Optional[int]) -> Image.Image:
 
 # ── Per-device state ──────────────────────────────────────────────────────────
 
+# Each device module's read_status() returns an object with .state (an Enum
+# whose values are shared: not_found / off / discharging / charging / full)
+# and .pct (set while discharging).
+_SHORT_TEXT = {
+    "not_found": "--",
+    "off":       "desligado",
+    "charging":  "carregando",
+    "full":      "carregado",
+}
+
+
 @dataclass
 class _DevState:
-    label:     str
-    last_pct:  Optional[int] = None
-    triggered: set           = field(default_factory=set)
+    label:       str
+    module:      object
+    last_state:  Optional[str] = None
+    last_pct:    Optional[int] = None     # only while discharging
+    triggered:   set           = field(default_factory=set)
+
+    def short_text(self) -> str:
+        if self.last_state == "discharging" and self.last_pct is not None:
+            return f"{self.last_pct}%"
+        return _SHORT_TEXT.get(self.last_state, "--")
 
 
 DEVICES: list[_DevState] = [
-    _DevState("Mouse X6"),
-    _DevState("Teclado K86"),
-    _DevState("Fone G PRO X2"),
-]
-
-READERS = [
-    mouse_battery.read_battery,
-    keyboard_battery.read_battery,
-    headset_battery.read_battery,
+    _DevState("Mouse X6",      mouse_battery),
+    _DevState("Teclado K86",   keyboard_battery),
+    _DevState("Fone G PRO X2", headset_battery),
 ]
 
 _tray_icon: Optional[pystray.Icon] = None
@@ -137,18 +149,17 @@ def _refresh_tray() -> None:
 
 
 def _tooltip() -> str:
+    # Windows truncates tray tooltips at 127 characters; keep entries short.
     lines = ["Battery Monitor"]
     for d in DEVICES:
-        pct_str = f"{d.last_pct}%" if d.last_pct is not None else "--"
-        lines.append(f"  {d.label}: {pct_str}")
+        lines.append(f"  {d.label}: {d.short_text()}")
     return "\n".join(lines)
 
 
 def _build_menu() -> pystray.Menu:
     items = []
     for d in DEVICES:
-        pct_str = f"{d.last_pct}%" if d.last_pct is not None else "--"
-        items.append(pystray.MenuItem(f"{d.label}: {pct_str}", None, enabled=False))
+        items.append(pystray.MenuItem(f"{d.label}: {d.short_text()}", None, enabled=False))
     items.append(pystray.Menu.SEPARATOR)
     items.append(pystray.MenuItem("Sair", _quit))
     return pystray.Menu(*items)
@@ -194,31 +205,36 @@ def _pid_stop(pid_file: Path) -> None:
 
 # ── Monitor thread ────────────────────────────────────────────────────────────
 
-def _run_device(dev: _DevState, read_fn) -> None:
+def _run_device(dev: _DevState) -> None:
     thresholds = sorted(THRESHOLDS, reverse=True)
     while True:
         try:
-            pct = read_fn()
+            status = dev.module.read_status()
+            state  = status.state.value
+            pct    = status.pct if state == "discharging" else None
+            text   = dev.module.describe(status)
         except Exception as e:
             log.debug("Read error for %s: %s", dev.label, e)
-            pct = None
+            state, pct, text = "not_found", None, "erro de leitura"
 
-        if pct is None:
-            if dev.last_pct is not None:
-                log.warning("%s: desconectado", dev.label)
-                dev.last_pct  = None
-                dev.triggered = set()
-                _refresh_tray()
-        else:
-            if pct != dev.last_pct:
-                log.info("%s: %d%%", dev.label, pct)
+        changed = (state, pct) != (dev.last_state, dev.last_pct)
+        if changed:
+            log.info("%s: %s", dev.label, text)
 
-            if dev.last_pct is not None and pct > dev.last_pct:
-                dev.triggered = {t for t in dev.triggered if t >= pct}
+        # Charging re-arms the alerts for the next discharge.
+        if state in ("charging", "full"):
+            dev.triggered = set()
+        if dev.last_state == "charging" and state == "full":
+            _notify(f"Carregado — {dev.label}", "100% — pode tirar o cabo.")
+        if pct is not None and dev.last_pct is not None and pct > dev.last_pct:
+            dev.triggered = {t for t in dev.triggered if t >= pct}
 
-            dev.last_pct = pct
+        dev.last_state = state
+        dev.last_pct   = pct
+        if changed:
             _refresh_tray()
 
+        if pct is not None:
             for t in thresholds:
                 if pct <= t and t not in dev.triggered:
                     dev.triggered.add(t)
@@ -246,10 +262,10 @@ def main() -> None:
 
     _pid_write()
 
-    for dev, read_fn in zip(DEVICES, READERS):
+    for dev in DEVICES:
         threading.Thread(
             target=_run_device,
-            args=(dev, read_fn),
+            args=(dev,),
             daemon=True,
             name=f"monitor-{dev.label}",
         ).start()
